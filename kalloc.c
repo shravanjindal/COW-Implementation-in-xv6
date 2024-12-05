@@ -9,6 +9,11 @@
 #include "mmu.h"
 #include "spinlock.h"
 
+int free_pages_count = 0;
+int ref_count[PHYSTOP / PGSIZE];
+// refcounter spinlock
+struct spinlock reflock;
+
 void freerange(void *vstart, void *vend);
 extern char end[]; // first address after kernel loaded from ELF file
                    // defined by the kernel linker script in kernel.ld
@@ -31,6 +36,7 @@ struct {
 void
 kinit1(void *vstart, void *vend)
 {
+  initlock(&reflock, "reflock");
   initlock(&kmem.lock, "kmem");
   kmem.use_lock = 0;
   freerange(vstart, vend);
@@ -42,15 +48,23 @@ kinit2(void *vstart, void *vend)
   freerange(vstart, vend);
   kmem.use_lock = 1;
 }
-
 void
 freerange(void *vstart, void *vend)
 {
   char *p;
   p = (char*)PGROUNDUP((uint)vstart);
-  for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)vend; p += PGSIZE){
+    // Initialize reference count array
+    if (kmem.use_lock)
+      acquire(&reflock);
+    ref_count[V2P(p)/PGSIZE] = 1;
+    if (kmem.use_lock)
+      release(&reflock);
+
     kfree(p);
+  } 
 }
+
 //PAGEBREAK: 21
 // Free the page of physical memory pointed at by v,
 // which normally should have been returned by a
@@ -64,16 +78,33 @@ kfree(char *v)
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(v, 1, PGSIZE);
+  if (kmem.use_lock)
+    acquire(&reflock);
+  // // Decrement reference count
+  if (ref_count[V2P(v)/PGSIZE] <= 1){
 
-  if(kmem.use_lock)
-    acquire(&kmem.lock);
-  r = (struct run*)v;
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  if(kmem.use_lock)
-    release(&kmem.lock);
+    ref_count[V2P(v)/PGSIZE] = 0;
+    if (kmem.use_lock)
+      release(&reflock);
+
+    // Fill with junk to catch dangling refs.
+    memset(v, 1, PGSIZE);
+
+    r = (struct run*)v;
+
+    if(kmem.use_lock)
+      acquire(&kmem.lock);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+    free_pages_count++;
+    if(kmem.use_lock)
+      release(&kmem.lock);
+  }
+  else {
+    ref_count[V2P(v)/PGSIZE]--;
+    if (kmem.use_lock)
+      release(&reflock);
+  }
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -87,10 +118,21 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
+    free_pages_count--;
+  }
   if(kmem.use_lock)
     release(&kmem.lock);
+  if(r){
+    if(kmem.use_lock)
+      acquire(&reflock);
+    ref_count[V2P(r)/PGSIZE]=1;
+    if(kmem.use_lock)
+      release(&reflock);
+  }
   return (char*)r;
 }
-
+// Physical memory allocator, intended to allocate
+// memory for user processes, kernel stacks, page table pages,
+// and pipe buffers. Allocates 4096-byte pages.

@@ -168,7 +168,6 @@ mkfs: mkfs.c fs.h
 UPROGS=\
 	_cat\
 	_echo\
-	_forktest\
 	_grep\
 	_init\
 	_kill\
@@ -181,6 +180,11 @@ UPROGS=\
 	_usertests\
 	_wc\
 	_zombie\
+	_getnumfreepages\
+	_test1\
+	_test2\
+	_test3\
+	_test4\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)
