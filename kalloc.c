@@ -9,6 +9,11 @@
 #include "mmu.h"
 #include "spinlock.h"
 
+int free_pages_count = 0;
+#define MAX_PAGES (PHYSTOP / PGSIZE) // Max number of pages
+int ref_count[MAX_PAGES];
+
+
 void freerange(void *vstart, void *vend);
 extern char end[]; // first address after kernel loaded from ELF file
                    // defined by the kernel linker script in kernel.ld
@@ -23,6 +28,44 @@ struct {
   struct run *freelist;
 } kmem;
 
+
+void incref(char *pa) {
+  if(kmem.use_lock)
+    acquire(&kmem.lock);
+  int index = ((uint)pa)/PGSIZE;
+  // cprintf("%d\n", index);
+  if (index >= 0 && index < MAX_PAGES) {
+      ref_count[index]++;
+      // cprintf("Incref: page %p ref_count now %d\n", pa, ref_count[index]);
+  }
+  if(kmem.use_lock)
+    release(&kmem.lock);
+}
+void decref(char *pa) {
+  if(kmem.use_lock)
+    acquire(&kmem.lock);
+  int index = ((uint)pa)/PGSIZE;
+  if (index >= 0 && index < MAX_PAGES) {
+      if (ref_count[index] > 0) {
+          ref_count[index]--;
+          // cprintf("Decreased ref_count of page %p to %d\n", pa, ref_count[index]);
+      }
+  }
+  // if (get_ref_count(pa) == 1){
+
+  // }
+  if(kmem.use_lock)
+    release(&kmem.lock);
+}
+// Get the reference count for a page
+int get_ref_count(char *pa) {
+    int index = ((uint)pa)/PGSIZE;
+    if (index >= 0 && index < MAX_PAGES) {
+        return ref_count[index];
+    }
+    return -1; // Invalid page
+}
+
 // Initialization happens in two phases.
 // 1. main() calls kinit1() while still using entrypgdir to place just
 // the pages mapped by entrypgdir on free list.
@@ -33,6 +76,10 @@ kinit1(void *vstart, void *vend)
 {
   initlock(&kmem.lock, "kmem");
   kmem.use_lock = 0;
+  // Initialize reference count array
+  for (int i = 0; i < MAX_PAGES; i++) {
+      ref_count[i] = 0;
+  }
   freerange(vstart, vend);
 }
 
@@ -42,7 +89,6 @@ kinit2(void *vstart, void *vend)
   freerange(vstart, vend);
   kmem.use_lock = 1;
 }
-
 void
 freerange(void *vstart, void *vend)
 {
@@ -64,6 +110,12 @@ kfree(char *v)
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree");
 
+  // Decrement reference count
+  decref((char *)V2P(v));
+  // Check if the page can be freed
+  if (get_ref_count((char *)V2P(v)) > 0) {
+      return; // Page is still in use
+  }
   // Fill with junk to catch dangling refs.
   memset(v, 1, PGSIZE);
 
@@ -72,6 +124,7 @@ kfree(char *v)
   r = (struct run*)v;
   r->next = kmem.freelist;
   kmem.freelist = r;
+  free_pages_count++;
   if(kmem.use_lock)
     release(&kmem.lock);
 }
@@ -87,10 +140,14 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
+    free_pages_count--;
+  }
+  if(r){
+    ref_count[((uint)(char*)V2P(r))/PGSIZE]++;
+  }
   if(kmem.use_lock)
     release(&kmem.lock);
   return (char*)r;
 }
-

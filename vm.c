@@ -9,7 +9,9 @@
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
-
+extern void incref(char *pa);
+extern void decref(char *pa);
+extern int get_ref_count(char *pa);
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
 void
@@ -68,8 +70,9 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
   for(;;){
     if((pte = walkpgdir(pgdir, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_P)
-      panic("remap");
+    if(!(*pte & PTE_COW))
+      if(*pte & !PTE_P)
+        panic("remap");
     *pte = pa | perm | PTE_P;
     if(a == last)
       break;
@@ -318,7 +321,7 @@ copyuvm(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
+  // char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
@@ -328,20 +331,40 @@ copyuvm(pde_t *pgdir, uint sz)
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
     pa = PTE_ADDR(*pte);
+    
+    // Increment the reference count for the shared page.
+    incref((char *)pa);
+    // Mark the page as read-only in both parent and child.
+    *pte &= ~PTE_W;
+    *pte |= PTE_COW;  // Custom flag to indicate Copy-On-Write.
+    
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    // Map the page in the child's page table.
+    if(mappages(d, (void*)i, PGSIZE, pa, flags=((*pte & ~PTE_W) | PTE_COW)) < 0) {
+      freevm(d);
+      return 0;
     }
-  }
-  return d;
 
-bad:
-  freevm(d);
-  return 0;
+    
+  }
+
+  // Flush TLB for the parent process to reflect the updated PTEs.
+  lcr3(V2P(pgdir));
+
+  return d;
+//     if((mem = kalloc()) == 0)
+//       goto bad;
+//     memmove(mem, (char*)P2V(pa), PGSIZE);
+//     if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
+//       kfree(mem);
+//       goto bad;
+//     }
+//   }
+//   return d;
+
+// bad:
+//   freevm(d);
+//   return 0;
 }
 
 //PAGEBREAK!
@@ -384,6 +407,76 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   }
   return 0;
 }
+// Handle a COW page fault
+int handle_cow_page(uint faulting_addr, pte_t *pte)
+{
+  // cprintf("Page Fault! \n");
+  uint pa = PTE_ADDR(*pte);  // Get the physical address of the faulting page
+  char *mem;
+
+  // Allocate a new page
+  mem = kalloc();
+  if(mem == 0) {
+    cprintf("Out of memory\n");
+    return -1;  // Allocation failed
+  }
+
+  // Copy the content of the original page to the new page
+  memmove(mem, (char*)P2V(pa), PGSIZE);
+
+  // Get the virtual page address
+  uint va = PGROUNDDOWN(faulting_addr);
+
+  // Unmap the old page and map the new page as writable
+  if(mappages(myproc()->pgdir, (void*)va, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+    kfree(mem);
+    return -1;  // Mapping failed
+  }
+
+  if (get_ref_count((char *)pa) == 1){
+    *pte |= PTE_W;
+    *pte &= ~PTE_COW;
+    // Flush TLB for the parent process to reflect the updated PTEs.
+    lcr3(V2P(myproc()->pgdir));
+  }
+  else
+    decref((char *)pa);  // Decrement the reference count for the old page
+
+  // Increment the reference count for the new page
+  incref((char *)V2P(mem));
+
+  // Return success
+  return 0;
+}
+// Function to handle page fault
+void handle_page_fault(struct trapframe *tf) {
+    uint faulting_addr = rcr2(); // Get the faulting address
+
+    // Walk the page table
+    pte_t *pte = walkpgdir(myproc()->pgdir, (void*)faulting_addr, 0);
+
+    if(pte == 0 || !(*pte & PTE_P)) {
+      // Invalid address: not mapped in page table
+      cprintf("Page fault: invalid address 0x%x\n", faulting_addr);
+      kill(myproc()->pid);  // Kill the process
+      return;
+    }
+
+    // If the fault is due to a COW page, handle the COW page fault
+    if(*pte & PTE_COW) {
+        if(handle_cow_page(faulting_addr, pte) < 0) {
+            cprintf("Failed to handle COW page fault\n");
+            // kill(myproc()->pid);  // Kill the process if COW handling fails
+            return;
+        }
+    } else {
+        // Regular page fault, kill the process
+        cprintf("Page fault: unauthorized write to address 0x%x\n", faulting_addr);
+        kill(myproc()->pid);
+        return;
+    }
+}
+
 
 //PAGEBREAK!
 // Blank page.
